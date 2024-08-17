@@ -188,7 +188,7 @@ class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.w1   = nn.Linear(config.n_embd, config.intermediate_size, bias=False)
-        self.w2 = nn.Linear(4*config.n_embd, config.n_embd, bias=False)
+        self.w2 = nn.Linear(config.intermediate_size, config.n_embd, bias=False)
         self.w3 = nn.Linear(config.n_embd, config.intermediate_size, bias=False)
     
     def forward(self, x):
@@ -225,7 +225,7 @@ class GPT(nn.Module):
 
         self.transformer.wte.weight = self.lm_head.weight # Linke
 
-        self.freqs = precompute_rope(config.n_embd // config.n_head, config.max_seq_len * 2, config.rope_theta, config.use_scaled_rope)
+        self.freqs = precompute_rope(config.n_embd // config.n_head, config.max_seq_len, config.rope_theta, config.use_scaled_rope)
 
         self.apply(self._init_weights)
 
@@ -249,9 +249,9 @@ class GPT(nn.Module):
         freqs = self.freqs.to(x.device)
 
         for block in self.transformer.h:
-            x = block(x)
+            x = block(x, freqs)
         x = self.transformer.norm_f(x)
-        logits = self.lm_head(x, freqs)
+        logits = self.lm_head(x)
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
@@ -354,4 +354,5 @@ class GPTConfig:
     use_scaled_rope: bool = False
     max_batch_size: int = 32
     max_seq_len:int = 2048
+
     sliding_window_size: int = 1024
