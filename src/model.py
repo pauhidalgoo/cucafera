@@ -5,7 +5,8 @@ It combines improvements from the LLAMA3 series, with others from Gemma2.
 It has:
 - GQA
 - Sliding window attention every two layers
-
+- GeGLU (thinking to maybe use SwiGLU or ReGLU)
+- RoPE
 
 I still would need to implement KV-caching to improve inference type.
 """
@@ -25,7 +26,7 @@ class CausalSelfAttentionGQA(nn.Module):
         self.head_dim = config.n_embd // config.n_head
 
 
-        shape = (config.n_head + 2 * config.n_kv_heads) * config.head_dim
+        shape = (config.n_head + 2 * config.n_kv_heads) * self.head_dim
 
         self.c_attn = nn.Linear(config.n_embd, shape, bias=False)
         self.c_proj = nn.Linear(self.head_dim * config.n_head, config.n_embd, bias=False)
@@ -81,7 +82,6 @@ class CausalSelfAttentionGQA(nn.Module):
             mask = torch.where(sliding_mask == 1, torch.zeros_like(scores), torch.full_like(scores, float("-inf")))
             scores = scores + mask
             scores = F.softmax(scores.float(), dim=-1).type_as(q)
-
             # [B, n_h, T, hs]
             y = torch.matmul(scores, v)
 
@@ -128,11 +128,11 @@ def rope_scaling(freqs: torch.Tensor):
 
 def precompute_rope(dim, end, theta, use_scaled):
     inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim)) # theta
-
+    
     if use_scaled:
         inv_freq = rope_scaling(inv_freq)
 
-    position_ids = torch.arange(end, device=freqs.device, dtype=torch.float32).unsqueeze(1) # en alguns llocs, seq_idx
+    position_ids = torch.arange(end, device=inv_freq.device, dtype=torch.float32) # en alguns llocs, seq_idx
     
     freqs = torch.outer(position_ids, inv_freq)
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
@@ -199,32 +199,15 @@ class Block(nn.Module):
 
     def __init__(self, type, config):
         super().__init__()
-        self.ln_1 = RMSNorm(config.n_embd, config.norm_eps)
+        self.norm_1 = RMSNorm(config.n_embd, config.norm_eps)
         self.attn = CausalSelfAttentionGQA(type, config)
-        self.ln_2 = RMSNorm(config.n_embd, config.norm_eps)
+        self.norm_2 = RMSNorm(config.n_embd, config.norm_eps)
         self.mlp = MLP(config)
     
     def forward(self, x, freq):
-        x = x + self.attn(self.ln_1(x), freq)
-        x = x + self.mlp(self.ln_2(x))
+        x = x + self.attn(self.norm_1(x), freq)
+        x = x + self.mlp(self.norm_2(x))
         return x
-
-
-@dataclass
-class GPTConfig:
-    block_size: int = 2048
-    vocab_size: int = 50257
-    n_layer: int = 32
-    n_head: int = 8
-    n_embd: int = 768
-    intermediate_size = 2048 # 3072
-    n_kv_heads: int = 4 # nombre de grups de query
-    norm_eps: int = 1e-5
-    rope_theta: float = 500000
-    use_scaled_rope: bool = False
-    max_batch_size: int = 32
-    max_seq_len:int = 2048
-    sliding_window_size: int = 1024
 
 class GPT(nn.Module):
     def __init__(self, config):
@@ -236,7 +219,7 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             h = nn.ModuleList([Block(types[i], config) for i in range(config.n_layer)]),
-            ln_f =  RMSNorm(config.n_embd, config.norm_eps),
+            norm_f =  RMSNorm(config.n_embd, config.norm_eps),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
@@ -267,7 +250,7 @@ class GPT(nn.Module):
 
         for block in self.transformer.h:
             x = block(x)
-        x = self.transformer.ln_f(x)
+        x = self.transformer.norm_f(x)
         logits = self.lm_head(x, freqs)
         loss = None
         if targets is not None:
@@ -333,19 +316,19 @@ class GPT(nn.Module):
             # let's train all parameters except the positional embeddings and lm_head
             n, m = 0, 0
             for name, param in self.named_parameters():
-                if name == "output.weight":
+                if name == "lm_head.weight":
                     # do not include
                     n += 1
                     continue
-                elif name == "tok_embeddings.weight":
+                elif name == "wte.weight":
                     # do not include and also does not require grad
                     m += 1
                     param.requires_grad = False
                 else:
                     # do include
                     train_params.append(param)
-            assert n == 1, "did not find output.weight"
-            assert m == 1, "did not find tok_embeddings.weight"
+            assert n == 1, "did not find lm_head.weight"
+            assert m == 1, "did not find wte.weight"
 
         print("number of parameters: ", sum(p.numel() for p in self.parameters()))
         print("number of trainable parameters: ", sum(p.numel() for p in train_params))
@@ -355,3 +338,20 @@ class GPT(nn.Module):
         extra_args = dict(fused=True) if use_fused else dict()
         optimizer = torch.optim.AdamW(train_params, lr=learning_rate, betas=betas, **extra_args)
         return optimizer
+
+
+@dataclass
+class GPTConfig:
+    block_size: int = 2048
+    vocab_size: int = 50257
+    n_layer: int = 32
+    n_head: int = 8
+    n_embd: int = 768
+    intermediate_size = 2048 # 3072
+    n_kv_heads: int = 4 # nombre de grups de query
+    norm_eps: int = 1e-5
+    rope_theta: float = 500000
+    use_scaled_rope: bool = False
+    max_batch_size: int = 32
+    max_seq_len:int = 2048
+    sliding_window_size: int = 1024
