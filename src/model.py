@@ -1,19 +1,13 @@
 """
-GQA: Grouped Query Attention
+This is THE model.
 
-Descrit al paper https://arxiv.org/pdf/2305.13245, divideix els "heads"
-de queries en grups, que comparteixen la mateixa clau i value. Es pot entendre
-com una generalització de MQA (multi-query attention, moltes queries comparteixen
-la mateixa key i value).
+It combines improvements from the LLAMA3 series, with others from Gemma2.
+It has:
+- GQA
+- Sliding window attention every two layers
 
-        MHA                     GQA                     MQA
-Values  ▯▯▯▯▯▯▯            ▯  ▯  ▯  ▯           ▯
-Keys    ▯▯▯▯▯▯▯            ▯  ▯  ▯  ▯           ▯
-Queries ▯▯▯▯▯▯▯           ▯▯▯▯ ▯▯▯▯     ▯▯▯▯▯▯
 
-D'aquesta manera, es millora l'efficiència dels models. Permet tenir
-frases més llargues, ja que el nombre de càlculs d'attention (que és quadràtic
-a la mida del context en el cas "normal") és més reduït.
+I still would need to implement KV-caching to improve inference type.
 """
 from dataclasses import dataclass
 import torch
@@ -24,7 +18,7 @@ import inspect
 
 
 class CausalSelfAttentionGQA(nn.Module):
-    def __init__(self, config):
+    def __init__(self, type, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
 
@@ -43,9 +37,12 @@ class CausalSelfAttentionGQA(nn.Module):
         self.n_kv_heads = config.n_kv_heads # Nombre de grups de query
 
         assert self.n_head % self.n_kv_heads == 0, "n_head must be divisible by n_group"
-        self.queries_per_kv = self.n_head // self.n_kv_heads
+        self.queries_per_kv = self.n_head // self.n_kv_heads # n_rep
 
         self.sliding_window_size = config.sliding_window_size
+        self.max_seq_len = config.block_size
+
+        self.attn_type = type
 
     def forward(self, x, freqs_cis):
         B, T, C = x.size()
@@ -68,8 +65,25 @@ class CausalSelfAttentionGQA(nn.Module):
             k = torch.repeat_interleave(k, dim=2, repeats=self.queries_per_kv)
             v = torch.repeat_interleave(v, dim=2, repeats=self.queries_per_kv)
 
+        # (B, n_h, T, hs)
+        q = q.transpose(1,2)
+        k = k.transpose(1,2)
+        v = v.transpose(1,2)
 
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        if self.attn_type == "Normal":
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            scores = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(self.head_dim)
+
+            all_ones = torch.ones((T, T), device=q.device)
+            sliding_mask = torch.triu(all_ones, -self.sliding_window_size + 1) * torch.tril(all_ones, self.sliding_window_size - 1)
+            sliding_mask = sliding_mask.unsqueeze(0).unsqueeze(0)
+            mask = torch.where(sliding_mask == 1, torch.zeros_like(scores), torch.full_like(scores, float("-inf")))
+            scores = scores + mask
+            scores = F.softmax(scores.float(), dim=-1).type_as(q)
+
+            # [B, n_h, T, hs]
+            y = torch.matmul(scores, v)
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
@@ -147,7 +161,6 @@ def apply_rope(x, freqs_cis):
 
     freqs_cis = freqs_cis.view(1, xshaped.size(1), 1, xshaped.size(3), 2)
     # freqs_cis becomes (1, seqlen, 1, head_dim/2, 2), e.g. (1, 8, 1, 64, 2)
-
     
     x_out2 = torch.stack(
         [
@@ -184,10 +197,10 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, type, config):
         super().__init__()
         self.ln_1 = RMSNorm(config.n_embd, config.norm_eps)
-        self.attn = CausalSelfAttentionGQA(config)
+        self.attn = CausalSelfAttentionGQA(type, config)
         self.ln_2 = RMSNorm(config.n_embd, config.norm_eps)
         self.mlp = MLP(config)
     
@@ -218,9 +231,11 @@ class GPT(nn.Module):
         super().__init__()
         self.config = config
 
+        types = ["Local", "Normal"] * (config.n_layer // 2)
+
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([Block(types[i], config) for i in range(config.n_layer)]),
             ln_f =  RMSNorm(config.n_embd, config.norm_eps),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
