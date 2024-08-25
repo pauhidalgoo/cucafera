@@ -19,7 +19,7 @@ import inspect
 
 
 class CausalSelfAttentionGQA(nn.Module):
-    def __init__(self, type, config):
+    def __init__(self,config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
 
@@ -40,10 +40,8 @@ class CausalSelfAttentionGQA(nn.Module):
         assert self.n_head % self.n_kv_heads == 0, "n_head must be divisible by n_group"
         self.queries_per_kv = self.n_head // self.n_kv_heads # n_rep
 
-        self.sliding_window_size = config.sliding_window_size
+        #self.sliding_window_size = config.sliding_window_size
         self.max_seq_len = config.block_size
-
-        self.attn_type = type
 
     def forward(self, x, freqs_cis):
         B, T, C = x.size()
@@ -71,9 +69,10 @@ class CausalSelfAttentionGQA(nn.Module):
         k = k.transpose(1,2)
         v = v.transpose(1,2)
 
-        if self.attn_type == "Normal":
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        else:
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+        """
+            SLIDING WINDOW DISCARDED (FOR NOW) TO MATCH EXACTLY LLAMAFORCAUSALLM
             scores = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(self.head_dim)
 
             all_ones = torch.ones((T, T), device=q.device)
@@ -84,6 +83,7 @@ class CausalSelfAttentionGQA(nn.Module):
             scores = F.softmax(scores.float(), dim=-1).type_as(q)
             # [B, n_h, T, hs]
             y = torch.matmul(scores, v)
+        """
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.o_proj(y)
@@ -197,10 +197,10 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, type, config):
+    def __init__(self,config):
         super().__init__()
         self.norm_1 = RMSNorm(config.n_embd, config.norm_eps) # input_layernorm
-        self.attn = CausalSelfAttentionGQA(type, config)
+        self.attn = CausalSelfAttentionGQA(config)
         self.norm_2 = RMSNorm(config.n_embd, config.norm_eps) # post_attention_layernorm
         self.mlp = MLP(config)
     
@@ -214,16 +214,14 @@ class Aloja(nn.Module):
         super().__init__()
         self.config = config
 
-        types = ["Local", "Normal"] * (config.n_layer // 2)
-
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd), #embed_tokens.weight
-            h = nn.ModuleList([Block(types[i], config) for i in range(config.n_layer)]),
+            h = nn.ModuleList([Block(config) for i in range(config.n_layer)]),
             norm_f =  RMSNorm(config.n_embd, config.norm_eps),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-        self.transformer.wte.weight = self.lm_head.weight # Linke
+        self.transformer.wte.weight = self.lm_head.weight # Linkeddddd
 
         self.freqs = precompute_rope(config.n_embd // config.n_head, config.max_seq_len, config.rope_theta, config.use_scaled_rope)
 
@@ -311,5 +309,3 @@ class AlojaConfig:
     use_scaled_rope: bool = False
     max_batch_size: int = 32
     max_seq_len:int = 2048
-
-    sliding_window_size: int = 1024
