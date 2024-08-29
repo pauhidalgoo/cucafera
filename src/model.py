@@ -17,6 +17,17 @@ from torch.nn import functional as F
 import math
 import inspect
 
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
+    bs, slen, n_kv_heads, head_dim = x.shape
+    if n_rep == 1:
+        return x
+    return (
+        x[:, :, :, None, :]
+        .expand(bs, slen, n_kv_heads, n_rep, head_dim)
+        .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
+    )
+
 
 class CausalSelfAttentionGQA(nn.Module):
     def __init__(self,config):
@@ -61,8 +72,8 @@ class CausalSelfAttentionGQA(nn.Module):
         k = apply_rope(k, freqs_cis)
 
         if self.n_kv_heads != self.n_head:
-            k = torch.repeat_interleave(k, dim=2, repeats=self.queries_per_kv)
-            v = torch.repeat_interleave(v, dim=2, repeats=self.queries_per_kv)
+            k = repeat_kv(k, n_rep=self.queries_per_kv)
+            v = repeat_kv(v, n_rep=self.queries_per_kv)
 
         # (B, n_h, T, hs)
         q = q.transpose(1,2)
@@ -91,14 +102,14 @@ class CausalSelfAttentionGQA(nn.Module):
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, d, eps=1e-5):
+    def __init__(self, d, eps=1e-6):
         super().__init__()
         self.eps = eps
         self.scale = nn.Parameter(torch.ones(d)) # weight
 
     def forward(self, x):
         norm = torch.sqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps).type_as(x)
-        return self.scale * (x / norm)
+        return self.scale.to(x.device) * (x / norm)
     
 
 def rope_scaling(freqs: torch.Tensor):
@@ -215,7 +226,7 @@ class Aloja(nn.Module):
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd), #embed_tokens.weight
+            wte = nn.Embedding(config.vocab_size, config.n_embd, padding_idx=3), #embed_tokens.weight
             h = nn.ModuleList([Block(config) for i in range(config.n_layer)]),
             norm_f =  RMSNorm(config.n_embd, config.norm_eps),
         ))
@@ -223,7 +234,7 @@ class Aloja(nn.Module):
 
         self.transformer.wte.weight = self.lm_head.weight # Linkeddddd
 
-        self.freqs = precompute_rope(config.n_embd // config.n_head, config.max_seq_len, config.rope_theta, config.use_scaled_rope)
+        self.freqs = precompute_rope(config.n_embd // config.n_head, config.max_seq_len * 2, config.rope_theta, config.use_scaled_rope)
 
         self.apply(self._init_weights)
 
@@ -236,69 +247,62 @@ class Aloja(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, start_pos:int = 0):
         B, T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is smaller"
 
-        tok_embd = self.transformer.wte(idx)
-        x = tok_embd
-        freqs = self.freqs.to(x.device)
+        x = self.transformer.wte(idx)
+        self.freqs = self.freqs.to(x.device)
+        freqs = self.freqs[:T]
+        mask = torch.full((T, T), float("-inf"), device=idx.device)
+        mask = torch.triu(mask, diagonal=1)
+        mask = mask.type_as(x)
 
         for block in self.transformer.h:
-            x = block(x, freqs)
+            x = block(x, freqs, mask)
         x = self.transformer.norm_f(x)
-        logits = self.lm_head(x)
+        logits = self.lm_head(x).float()
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            loss = F.cross_entropy(
+                input=logits.transpose(1, 2),
+                target=targets,
+                reduction="mean",
+                ignore_index=3,
+            )
         return logits, loss
     
     
     def configure_optimizers(self, learning_rate, weight_decay=0.0, betas=(0.9, 0.97), device_type='cuda'):
-        train_params = []
-
-        finetune_type = "all"
-        if finetune_type == "rmsnorm":
-            # let's only train the RMSNorm parameters to start
-            for name, param in self.named_parameters():
-                if "norm" in name:
-                    train_params.append(param)
-        elif finetune_type == "all":
-            # let's train all parameters
-            for param in self.parameters():
-                train_params.append(param)
-        elif finetune_type == "all_no_pos":
-            # let's train all parameters except the positional embeddings and lm_head
-            n, m = 0, 0
-            for name, param in self.named_parameters():
-                if name == "lm_head.weight":
-                    # do not include
-                    n += 1
-                    continue
-                elif name == "wte.weight":
-                    # do not include and also does not require grad
-                    m += 1
-                    param.requires_grad = False
-                else:
-                    # do include
-                    train_params.append(param)
-            assert n == 1, "did not find lm_head.weight"
-            assert m == 1, "did not find wte.weight"
-
-        print("number of parameters: ", sum(p.numel() for p in self.parameters()))
-        print("number of trainable parameters: ", sum(p.numel() for p in train_params))
+        # start with all of the candidate parameters (that require grad)
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        if master_process:
+            print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+            print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
         # Create AdamW optimizer and use the fused version if it is available
-        fused_available = True #'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device_type == 'cuda'
-        extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(train_params, lr=learning_rate, betas=betas, **extra_args)
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device_type == "cuda"
+        if master_process:
+            print(f"using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, eps=1e-8, fused=use_fused)
         return optimizer
 
 
 @dataclass
 class AlojaConfig:
     block_size: int = 2048
-    vocab_size: int = 50257
+    vocab_size: int = 65536
     n_layer: int = 32
     n_head: int = 8
     n_embd: int = 768
