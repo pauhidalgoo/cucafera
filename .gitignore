@@ -2,3 +2,7 @@
 /data/patufet
 /data/patufet-mini
 *.pt
+*.jsonl
+__pycache__
+.env
+/acontinua
