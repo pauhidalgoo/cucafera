@@ -3,6 +3,7 @@ import numpy as np
 import torch
 import math
 from torch.nn import functional as F
+from model import Cucafera, CucaferaConfig
 
 def load_tokens(filename):
     with open(filename, "rb") as f:

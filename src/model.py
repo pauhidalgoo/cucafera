@@ -1,13 +1,36 @@
 """
-This is THE model.
+This is the cucafera model. The initial version of this file contained some error (we couldn't find exactly where, we suspect it was a problem with 
+the dimensions when computing the attention), so this one is based on the transformers library code.
 
-It combines improvements from the LLAMA3 series, with others from Gemma2.
+https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py
+
+It uses the improvements from the LLAMA3 series.
 It has:
 - GQA
-- GeGLU (thinking to maybe use SwiGLU or ReGLU)
+- GeGLU * (llama uses SwiGLU)
 - RoPE
 
 I still would need to implement KV-caching to improve inference type.
+
+# coding=utf-8
+# Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
+#
+# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
+# and OPT implementations in this library. It has been modified from its
+# original forms to accommodate minor architectural differences compared
+# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """
 from dataclasses import dataclass
 import torch
@@ -30,6 +53,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 """
+ORIGINAL BAD SELF-ATTENTION (the RoPE was also different)
 class CausalSelfAttentionGQA(nn.Module):
     def __init__(self,config):
         super().__init__()
@@ -112,7 +136,7 @@ class CausalSelfAttentionGQA(nn.Module):
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, config.n_embd, bias=False)
 
 
-        #self.sliding_window_size = config.sliding_window_size
+        #self.sliding_window_size = config.sliding_window_size     initially we also wanted to try the alternate sliding window from Gemma
         self.max_seq_len = config.block_size
 
     def forward(self, x, cos_sin: tuple, return_attention = None):
@@ -313,6 +337,7 @@ class Cucafera(nn.Module):
         return logits, loss
     
     def configure_optimizers(self, learning_rate, weight_decay=0.1, betas=(0.9, 0.95), device_type='cuda'):
+        # From Andrej Karpathy's NanoGPT
         param_dict = {pn: p for pn, p in self.named_parameters()}
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
         # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
