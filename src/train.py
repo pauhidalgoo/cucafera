@@ -112,9 +112,9 @@ val_loader = DataLoaderLite(B=B, T =T, split="val")
 
 torch.set_float32_matmul_precision("high")
 
-model_config = AlojaConfig()
+model_config = CucaferaConfig()
 
-model = Aloja(model_config)
+model = Cucafera(model_config)
 
 
 

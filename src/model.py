@@ -255,7 +255,7 @@ class Block(nn.Module):
 
         return x
 
-class Aloja(nn.Module):
+class Cucafera(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -336,7 +336,7 @@ class Aloja(nn.Module):
 
 
 @dataclass
-class AlojaConfig:
+class CucaferaConfig:
     block_size: int = 2048
     vocab_size: int = 65536
     n_layer: int = 30
